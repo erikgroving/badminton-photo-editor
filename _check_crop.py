@@ -1,0 +1,10 @@
+import torch
+ckpt = torch.load('checkpoints/cropping_angle_vit_large_patch14_dinov2_lr1e6.pt', map_location='cpu', weights_only=False)
+m = ckpt.get('metrics', {})
+print(f"Epoch:       {ckpt.get('epoch', '?')}")
+print(f"Median IoU:  {m.get('median_iou', '?')}")
+print(f"Mean IoU:    {m.get('mean_iou', '?')}")
+print(f"Angle MAE:   {m.get('angle_mae', '?')}")
+print(f"Val loss:    {m.get('val_loss', '?')}")
+print()
+print("Full metrics:", m)

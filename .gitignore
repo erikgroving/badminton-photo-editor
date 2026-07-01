@@ -1,0 +1,39 @@
+# ── ML weights (too large for git — copy manually into checkpoints/) ──────────
+*.pt
+*.pth
+*.bin
+
+# ── PyInstaller build artifacts ────────────────────────────────────────────────
+dist/
+build/
+*.spec.bak
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+venv/
+*.egg
+
+# ── Generated / cached data ───────────────────────────────────────────────────
+cache/
+embeddings/
+logs/
+diag_crops/
+sanity_check/
+test_coverage_output/
+*.pkl
+session_id.txt
+diag_*.jpg
+diag_*.png
+
+# ── Claude AI session files ───────────────────────────────────────────────────
+.claude/
+
+# ── OS ────────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+Desktop.ini
