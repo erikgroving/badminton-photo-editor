@@ -32,6 +32,60 @@ diag_*.png
 # Training data caches — Windows paths, not needed for Mac build
 data/*.json
 
+# ── Research / experiment scripts (not needed for build or training) ──────────
+_agent_*.py
+_check_*.py
+_test_*.py
+_run_cache_to_completion.py
+experiments/
+ui/
+# data cache builders (generate local .json caches, not needed for inference)
+data/attribute_extractor.py
+data/build_yolo_crop_gt.py
+data/cache_*.py
+data/color_analyzer.py
+data/crop_detector.py
+data/detect_watermark.py
+data/sequence_dataset.py
+# model research variants (not used in production)
+models/culling/attribute_model.py
+models/culling/attribute_train.py
+models/culling/cluster_culling.py
+models/culling/fn_weight_sweep.py
+models/culling/lstm_model.py
+models/*/sweep.py
+# analysis / sweep / eval scripts
+analyze_bursts.py
+burst_constrained_eval.py
+burst_recall_crosscheck.py
+check_burst_keeps.py
+check_exif.py
+cluster_culling.py
+diag_boxes.py
+diag_crop.py
+ensemble_search.py
+eval_crop_distribution.py
+extract_b3_embeddings.py
+recall_vs_selection.py
+retrain_dinov2_large.py
+retrain_mobilenetv3_splits.py
+run_color_experiments.py
+run_color_pipeline.py
+run_experiments_sequential.py
+sample_crops.py
+show_culling_results.py
+sweep_color.py
+sweep_crop.py
+sweep_crop_with_rotation.py
+sweep_crop_yolo.py
+sweep_large.py
+test_color_gt.py
+test_coverage.py
+test_crop_prediction.py
+train_crop_gan.py
+train_lstm.py
+watch_training.py
+
 # ── Claude AI session files ───────────────────────────────────────────────────
 .claude/
 
