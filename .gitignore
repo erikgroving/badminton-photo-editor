@@ -29,6 +29,8 @@ test_coverage_output/
 session_id.txt
 diag_*.jpg
 diag_*.png
+# Training data caches — Windows paths, not needed for Mac build
+data/*.json
 
 # ── Claude AI session files ───────────────────────────────────────────────────
 .claude/
