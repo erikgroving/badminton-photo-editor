@@ -182,19 +182,23 @@ class CropLoss(nn.Module):
         Samples with no detection (all-zero bbox) are explicitly masked out.
     """
     def __init__(self, alpha: float = 0.5, angle_weight: float = 0.25,
-                 player_weight: float = 0.5, player_margin: float = 0.0):
+                 player_weight: float = 0.5, player_margin: float = 0.0,
+                 ar_weight: float = 0.0, use_ciou: bool = False):
         super().__init__()
         self.alpha          = alpha
         self.angle_weight   = angle_weight
         self.player_weight  = player_weight
         self.player_margin  = player_margin
+        self.ar_weight      = ar_weight
+        self.use_ciou       = use_ciou
 
     def forward(self, box_pred: torch.Tensor, box_target: torch.Tensor,
                 angle_pred: torch.Tensor | None = None,
                 angle_target: torch.Tensor | None = None,
                 player_bbox: torch.Tensor | None = None) -> torch.Tensor:
         sl1      = nn.functional.smooth_l1_loss(box_pred, box_target)
-        iou      = _box_iou_loss(box_pred, box_target)
+        iou      = (_box_ciou_loss(box_pred, box_target) if self.use_ciou
+                    else _box_iou_loss(box_pred, box_target))
         box_loss = self.alpha * sl1 + (1.0 - self.alpha) * iou
 
         if angle_pred is not None and angle_target is not None:
@@ -221,6 +225,14 @@ class CropLoss(nn.Module):
                 )
                 total = total + self.player_weight * clip.mean()
 
+        if self.ar_weight > 0.0:
+            w_pred = (box_pred[:, 2] - box_pred[:, 0]).clamp(min=1e-6)
+            h_pred = (box_pred[:, 3] - box_pred[:, 1]).clamp(min=1e-6)
+            w_gt   = (box_target[:, 2] - box_target[:, 0]).clamp(min=1e-6)
+            h_gt   = (box_target[:, 3] - box_target[:, 1]).clamp(min=1e-6)
+            ar_loss = nn.functional.smooth_l1_loss(w_pred / h_pred, w_gt / h_gt)
+            total = total + self.ar_weight * ar_loss
+
         return total
 
 
@@ -236,6 +248,44 @@ def _box_iou_loss(pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
     gh   = (gt[:, 3]   - gt[:, 1]).clamp(0)
     union = pw * ph + gw * gh - inter
     return (1.0 - inter / (union + 1e-6)).mean()
+
+
+def _box_ciou_loss(pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
+    """Complete IoU loss (Zheng et al. 2020): IoU − center-distance/enclosing-diag
+    − aspect-ratio consistency.  Subsumes the ad-hoc ar_weight term."""
+    eps = 1e-6
+    ix1  = torch.max(pred[:, 0], gt[:, 0])
+    iy1  = torch.max(pred[:, 1], gt[:, 1])
+    ix2  = torch.min(pred[:, 2], gt[:, 2])
+    iy2  = torch.min(pred[:, 3], gt[:, 3])
+    inter = (ix2 - ix1).clamp(0) * (iy2 - iy1).clamp(0)
+    pw   = (pred[:, 2] - pred[:, 0]).clamp(min=eps)
+    ph   = (pred[:, 3] - pred[:, 1]).clamp(min=eps)
+    gw   = (gt[:, 2]   - gt[:, 0]).clamp(min=eps)
+    gh   = (gt[:, 3]   - gt[:, 1]).clamp(min=eps)
+    union = pw * ph + gw * gh - inter
+    iou   = inter / (union + eps)
+
+    # center distance over enclosing-box diagonal
+    pcx = (pred[:, 0] + pred[:, 2]) * 0.5
+    pcy = (pred[:, 1] + pred[:, 3]) * 0.5
+    gcx = (gt[:, 0]   + gt[:, 2])   * 0.5
+    gcy = (gt[:, 1]   + gt[:, 3])   * 0.5
+    rho2 = (pcx - gcx) ** 2 + (pcy - gcy) ** 2
+    ex1  = torch.min(pred[:, 0], gt[:, 0])
+    ey1  = torch.min(pred[:, 1], gt[:, 1])
+    ex2  = torch.max(pred[:, 2], gt[:, 2])
+    ey2  = torch.max(pred[:, 3], gt[:, 3])
+    c2   = (ex2 - ex1) ** 2 + (ey2 - ey1) ** 2 + eps
+
+    # aspect-ratio consistency
+    import math
+    v = (4.0 / math.pi ** 2) * (torch.atan(gw / gh) - torch.atan(pw / ph)) ** 2
+    with torch.no_grad():
+        alpha = v / (1.0 - iou + v + eps)
+
+    ciou = iou - rho2 / c2 - alpha * v
+    return (1.0 - ciou).mean()
 
 
 def box_iou_numpy(pred: np.ndarray, gt: np.ndarray) -> np.ndarray:
@@ -352,3 +402,392 @@ def _load_backbone_from_culling_ckpt(backbone_model: nn.Module, backbone_name: s
     print(f"  Backbone init from culling ckpt: {matched}/{len(backbone_state)} keys matched  "
           f"missing={len(missing)}  unexpected={len(unexpected)}")
     return matched > 0
+
+
+# ── Exp 7: pose keypoints + dual portrait/landscape heads ─────────────────────
+
+# COCO 17-keypoint left/right swap pairs for horizontal flip augmentation
+COCO_FLIP_PAIRS = [(1, 2), (3, 4), (5, 6), (7, 8), (9, 10), (11, 12), (13, 14), (15, 16)]
+N_KEYPOINTS = 17
+POSE_DIM    = N_KEYPOINTS * 2   # x, y only; YOLO-Pose confidence is always 0.5 so we drop it
+
+
+def flip_pose_kpts(kpts: list[float]) -> list[float]:
+    """Mirror x coords and swap left/right pairs for hflip augmentation."""
+    arr = list(kpts)
+    for i in range(N_KEYPOINTS):
+        arr[i * 2] = 1.0 - arr[i * 2]
+    for a, b in COCO_FLIP_PAIRS:
+        arr[a*2],   arr[b*2]   = arr[b*2],   arr[a*2]
+        arr[a*2+1], arr[b*2+1] = arr[b*2+1], arr[a*2+1]
+    return arr
+
+
+class CombinedDINOv2Exp7(nn.Module):
+    """
+    DINOv2 + pose keypoints conditioning + separate portrait/landscape box heads.
+
+    Conditioning (85-dim default):
+        union_bbox[4] + rich_features[13] + rot_features[7] + img_stats[27] + pose_kpts[34]
+
+    Two box heads (landscape / portrait) blended by a soft sigmoid gate derived
+    from the predicted angle_norm.  angle_norm > 0.5 (>45°) routes to portrait.
+
+    Compatible with dynamic_img_size=True backbones for 770px input.
+    """
+    def __init__(self, backbone: nn.Module, backbone_dim: int,
+                 cond_dim: int = 51 + POSE_DIM,
+                 cond_emb_dim: int = 128):
+        super().__init__()
+        self.backbone        = backbone
+        self.cond_dim        = cond_dim
+        self.cond_emb_dim    = cond_emb_dim
+        self.use_player_bbox = True
+        self.use_angle_head  = True
+
+        self.cond_encoder = nn.Sequential(
+            nn.Linear(cond_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, cond_emb_dim),
+            nn.ReLU(),
+        )
+        head_in = backbone_dim + cond_emb_dim
+
+        def _head() -> nn.Sequential:
+            return nn.Sequential(
+                nn.Linear(head_in, 256), nn.ReLU(),
+                nn.Dropout(0.2),
+                nn.Linear(256, 4), nn.Sigmoid(),
+            )
+
+        self.box_head_landscape = _head()
+        self.box_head_portrait  = _head()
+        self.angle_head = nn.Sequential(
+            nn.Linear(head_in, 64), nn.ReLU(),
+            nn.Linear(64, 1),
+        )
+
+    def forward(self,
+                x: torch.Tensor,
+                union_bbox: torch.Tensor,
+                primary_bbox: torch.Tensor,
+                img_stats: torch.Tensor,
+                pose_kpts: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+        feats = self.backbone(x)
+        rich  = build_rich_features(union_bbox, primary_bbox)
+        rot   = build_rot_features(primary_bbox)
+
+        parts = [union_bbox, rich, rot, img_stats]
+        if pose_kpts is not None:
+            parts.append(pose_kpts)
+        cond     = torch.cat(parts, dim=1)
+        cond_emb = self.cond_encoder(cond)
+        combined = torch.cat([feats, cond_emb], dim=1)
+
+        angle_norm = self.angle_head(combined).squeeze(-1)      # [B]
+        box_l      = self.box_head_landscape(combined)           # [B, 4]
+        box_p      = self.box_head_portrait(combined)            # [B, 4]
+
+        # Soft blend: portrait_w → 1 when angle_norm > 0.5  (portrait threshold = 45°)
+        p_w = torch.sigmoid((angle_norm - 0.5) * 10).unsqueeze(-1)  # [B, 1]
+        box = (1.0 - p_w) * box_l + p_w * box_p                     # [B, 4]
+
+        return box, angle_norm
+
+    def set_grad_checkpointing(self, enable: bool = True) -> None:
+        if hasattr(self.backbone, "set_grad_checkpointing"):
+            self.backbone.set_grad_checkpointing(enable=enable)
+
+
+def _load_vit_pretrained_remapped(model: nn.Module, backbone: str,
+                                  dynamic_img_size: bool = True) -> None:
+    """Download pretrained ViT weights and remap norm→fc_norm for global_pool='avg'.
+
+    When global_pool='avg', timm stores the final layer norm as 'fc_norm' instead
+    of 'norm', but DINOv2 checkpoints on HuggingFace use 'norm'. We create a
+    temporary model with global_pool='' to load the original keys, then remap.
+    """
+    import timm
+    extra = {"dynamic_img_size": True} if dynamic_img_size else {}
+    try:
+        tmp = timm.create_model(backbone, pretrained=True,
+                                num_classes=0, global_pool="", **extra)
+        sd_src = tmp.state_dict()
+        del tmp
+    except Exception as e:
+        print(f"  Pretrained load warning (using random init): {e}")
+        return
+
+    # Remap norm→fc_norm so it matches the global_pool='avg' model
+    remapped = {}
+    for k, v in sd_src.items():
+        new_k = "fc_norm." + k[len("norm."):] if k.startswith("norm.") else k
+        remapped[new_k] = v
+
+    missing, unexpected = model.load_state_dict(remapped, strict=False)
+    print(f"  Pretrained {backbone}: loaded "
+          f"(missing={len(missing)} unexpected={len(unexpected)})")
+
+
+def build_exp7_model(backbone: str = "vit_large_patch14_reg4_dinov2",
+                     pretrained: bool = False,
+                     pose_dim: int = POSE_DIM,
+                     cond_emb_dim: int = 128,
+                     dynamic_img_size: bool = True) -> "CombinedDINOv2Exp7":
+    import timm
+    extra = {"dynamic_img_size": True} if dynamic_img_size else {}
+    bb    = timm.create_model(backbone, pretrained=False,
+                              num_classes=0, global_pool="avg", **extra)
+    if pretrained:
+        _load_vit_pretrained_remapped(bb, backbone, dynamic_img_size)
+    return CombinedDINOv2Exp7(bb, bb.num_features,
+                               cond_dim=51 + pose_dim,
+                               cond_emb_dim=cond_emb_dim)
+
+
+# ── Exp 8: spatial patch features + hard portrait/landscape head routing ───────
+
+class CombinedDINOv2Exp8(nn.Module):
+    """
+    Exp7 + two improvements:
+
+    1. Spatial features: concatenates CLS token with mean-pooled patch tokens,
+       then projects to backbone_dim.  CLS captures global semantics; patch mean
+       retains spatial layout information lost by global-avg-pool alone.
+
+    2. Hard head routing during training: routes each sample to the correct
+       portrait or landscape box head using the GT angle label (is_portrait flag).
+       At inference is_portrait=None → soft sigmoid blend (same as exp7).
+    """
+    def __init__(self, backbone: nn.Module, backbone_dim: int,
+                 cond_dim: int = 51 + POSE_DIM,
+                 cond_emb_dim: int = 128):
+        super().__init__()
+        self.backbone        = backbone
+        self.cond_dim        = cond_dim
+        self.cond_emb_dim    = cond_emb_dim
+        self.use_player_bbox = True
+        self.use_angle_head  = True
+
+        # Project [cls; patch_mean] → backbone_dim
+        self.spatial_proj = nn.Sequential(
+            nn.Linear(2 * backbone_dim, backbone_dim),
+            nn.LayerNorm(backbone_dim),
+            nn.GELU(),
+        )
+        self.cond_encoder = nn.Sequential(
+            nn.Linear(cond_dim, 256), nn.ReLU(),
+            nn.Linear(256, cond_emb_dim), nn.ReLU(),
+        )
+        head_in = backbone_dim + cond_emb_dim
+
+        def _head() -> nn.Sequential:
+            return nn.Sequential(
+                nn.Linear(head_in, 256), nn.ReLU(),
+                nn.Dropout(0.2),
+                nn.Linear(256, 4), nn.Sigmoid(),
+            )
+
+        self.box_head_landscape = _head()
+        self.box_head_portrait  = _head()
+        self.angle_head = nn.Sequential(
+            nn.Linear(head_in, 64), nn.ReLU(),
+            nn.Linear(64, 1),
+        )
+
+    def forward(self,
+                x: torch.Tensor,
+                union_bbox: torch.Tensor,
+                primary_bbox: torch.Tensor,
+                img_stats: torch.Tensor,
+                pose_kpts: torch.Tensor | None = None,
+                is_portrait: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+        # --- spatial feature extraction ---
+        seq        = self.backbone.forward_features(x)    # [B, N_total, D]
+        n_prefix   = getattr(self.backbone, "num_prefix_tokens", 1)  # CLS + reg tokens
+        cls_feat   = seq[:, 0]                            # [B, D] CLS token
+        patch_feat = seq[:, n_prefix:].mean(dim=1)        # [B, D] avg of patch tokens
+        feats      = self.spatial_proj(
+            torch.cat([cls_feat, patch_feat], dim=1))     # [B, D]
+
+        # --- conditioning ---
+        rich  = build_rich_features(union_bbox, primary_bbox)
+        rot   = build_rot_features(primary_bbox)
+        parts = [union_bbox, rich, rot, img_stats]
+        if pose_kpts is not None:
+            parts.append(pose_kpts)
+        cond_emb = self.cond_encoder(torch.cat(parts, dim=1))
+        combined = torch.cat([feats, cond_emb], dim=1)
+
+        angle_norm = self.angle_head(combined).squeeze(-1)   # [B]
+        box_l      = self.box_head_landscape(combined)        # [B, 4]
+        box_p      = self.box_head_portrait(combined)         # [B, 4]
+
+        if is_portrait is not None:
+            # Hard routing: GT label selects the head (training only)
+            mask = is_portrait.unsqueeze(-1)                 # [B, 1] bool
+            box  = torch.where(mask, box_p, box_l)
+        else:
+            # Soft blend at inference
+            p_w = torch.sigmoid((angle_norm - 0.5) * 10).unsqueeze(-1)
+            box = (1.0 - p_w) * box_l + p_w * box_p
+
+        return box, angle_norm
+
+    def set_grad_checkpointing(self, enable: bool = True) -> None:
+        if hasattr(self.backbone, "set_grad_checkpointing"):
+            self.backbone.set_grad_checkpointing(enable=enable)
+
+
+def build_exp8_model(backbone: str = "vit_large_patch14_reg4_dinov2",
+                     pretrained: bool = False,
+                     pose_dim: int = POSE_DIM,
+                     cond_emb_dim: int = 128,
+                     dynamic_img_size: bool = True) -> "CombinedDINOv2Exp8":
+    import timm
+    extra = {"dynamic_img_size": True} if dynamic_img_size else {}
+    bb    = timm.create_model(backbone, pretrained=False,
+                              num_classes=0, global_pool="avg", **extra)
+    if pretrained:
+        _load_vit_pretrained_remapped(bb, backbone, dynamic_img_size)
+    return CombinedDINOv2Exp8(bb, bb.num_features,
+                               cond_dim=51 + pose_dim,
+                               cond_emb_dim=cond_emb_dim)
+
+
+# ── Exp 9a: multi-layer feature fusion + attentive pooling ─────────────────────
+
+class AttentivePooler(nn.Module):
+    """Learned-query cross-attention pooling over patch tokens.
+
+    Mean-pooling destroys spatial selectivity; a small set of learned queries
+    lets each query attend to the regions relevant to its output (e.g. one per
+    box edge).  ~1M params for D=1024, n_queries=4.
+    """
+    def __init__(self, dim: int, n_queries: int = 4, n_heads: int = 8):
+        super().__init__()
+        self.queries = nn.Parameter(torch.randn(1, n_queries, dim) * 0.02)
+        self.attn    = nn.MultiheadAttention(dim, n_heads, batch_first=True)
+        self.norm    = nn.LayerNorm(dim)
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:   # [B, N, D]
+        q      = self.queries.expand(tokens.shape[0], -1, -1)  # [B, Q, D]
+        out, _ = self.attn(q, tokens, tokens, need_weights=False)
+        return self.norm(out)                                  # [B, Q, D]
+
+
+class CombinedDINOv2Exp9(nn.Module):
+    """
+    Exp8 + two evidence-backed feature upgrades (DINOv2 paper Table 11 shows
+    ~13% dense-regression gain from multi-layer features; attentive-probing
+    literature shows learned-query pooling beats mean pooling):
+
+    1. Multi-layer fusion: patch tokens from 4 intermediate blocks are
+       concatenated channel-wise and projected back to backbone_dim.
+    2. Attentive pooling: 4 learned queries cross-attend the fused tokens
+       instead of mean-pooling them.
+
+    Head structure (cond encoder, dual portrait/landscape box heads with hard
+    GT routing at training / soft blend at inference, angle head) is identical
+    to exp8 so training and evaluation code is shared.
+    """
+    LAYER_INDICES = (5, 11, 17, 23)   # for ViT-L (24 blocks)
+
+    def __init__(self, backbone: nn.Module, backbone_dim: int,
+                 cond_dim: int = 51 + POSE_DIM,
+                 cond_emb_dim: int = 128,
+                 n_queries: int = 4):
+        super().__init__()
+        self.backbone        = backbone
+        self.cond_dim        = cond_dim
+        self.cond_emb_dim    = cond_emb_dim
+        self.use_player_bbox = True
+        self.use_angle_head  = True
+
+        n_layers = len(self.LAYER_INDICES)
+        self.fuse_proj = nn.Sequential(
+            nn.Linear(n_layers * backbone_dim, backbone_dim),
+            nn.LayerNorm(backbone_dim),
+            nn.GELU(),
+        )
+        self.pool = AttentivePooler(backbone_dim, n_queries=n_queries)
+        self.pool_proj = nn.Sequential(
+            nn.Linear(n_queries * backbone_dim, backbone_dim),
+            nn.LayerNorm(backbone_dim),
+            nn.GELU(),
+        )
+        self.cond_encoder = nn.Sequential(
+            nn.Linear(cond_dim, 256), nn.ReLU(),
+            nn.Linear(256, cond_emb_dim), nn.ReLU(),
+        )
+        head_in = backbone_dim + cond_emb_dim
+
+        def _head() -> nn.Sequential:
+            return nn.Sequential(
+                nn.Linear(head_in, 256), nn.ReLU(),
+                nn.Dropout(0.2),
+                nn.Linear(256, 4), nn.Sigmoid(),
+            )
+
+        self.box_head_landscape = _head()
+        self.box_head_portrait  = _head()
+        self.angle_head = nn.Sequential(
+            nn.Linear(head_in, 64), nn.ReLU(),
+            nn.Linear(64, 1),
+        )
+
+    def forward(self,
+                x: torch.Tensor,
+                union_bbox: torch.Tensor,
+                primary_bbox: torch.Tensor,
+                img_stats: torch.Tensor,
+                pose_kpts: torch.Tensor | None = None,
+                is_portrait: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+        # --- multi-layer spatial features ---
+        inters = self.backbone.forward_intermediates(
+            x, indices=list(self.LAYER_INDICES), norm=True,
+            output_fmt="NLC", intermediates_only=True)         # 4 × [B, N, D]
+        tokens = self.fuse_proj(torch.cat(inters, dim=-1))     # [B, N, D]
+        pooled = self.pool(tokens)                             # [B, Q, D]
+        feats  = self.pool_proj(pooled.flatten(1))             # [B, D]
+
+        # --- conditioning (same as exp8) ---
+        rich  = build_rich_features(union_bbox, primary_bbox)
+        rot   = build_rot_features(primary_bbox)
+        parts = [union_bbox, rich, rot, img_stats]
+        if pose_kpts is not None:
+            parts.append(pose_kpts)
+        cond_emb = self.cond_encoder(torch.cat(parts, dim=1))
+        combined = torch.cat([feats, cond_emb], dim=1)
+
+        angle_norm = self.angle_head(combined).squeeze(-1)
+        box_l      = self.box_head_landscape(combined)
+        box_p      = self.box_head_portrait(combined)
+
+        if is_portrait is not None:
+            box = torch.where(is_portrait.unsqueeze(-1), box_p, box_l)
+        else:
+            p_w = torch.sigmoid((angle_norm - 0.5) * 10).unsqueeze(-1)
+            box = (1.0 - p_w) * box_l + p_w * box_p
+
+        return box, angle_norm
+
+    def set_grad_checkpointing(self, enable: bool = True) -> None:
+        if hasattr(self.backbone, "set_grad_checkpointing"):
+            self.backbone.set_grad_checkpointing(enable=enable)
+
+
+def build_exp9_model(backbone: str = "vit_large_patch14_reg4_dinov2",
+                     pretrained: bool = False,
+                     pose_dim: int = POSE_DIM,
+                     cond_emb_dim: int = 128,
+                     dynamic_img_size: bool = True) -> "CombinedDINOv2Exp9":
+    import timm
+    extra = {"dynamic_img_size": True} if dynamic_img_size else {}
+    bb    = timm.create_model(backbone, pretrained=False,
+                              num_classes=0, global_pool="avg", **extra)
+    if pretrained:
+        _load_vit_pretrained_remapped(bb, backbone, dynamic_img_size)
+    return CombinedDINOv2Exp9(bb, bb.num_features,
+                               cond_dim=51 + pose_dim,
+                               cond_emb_dim=cond_emb_dim)
