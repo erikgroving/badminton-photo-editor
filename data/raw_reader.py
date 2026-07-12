@@ -82,6 +82,25 @@ def get_raw_flip(raw_path: str | Path) -> int:
         return 0
 
 
+def get_as_shot_camlog(raw_path: str | Path) -> float | None:
+    """
+    Return ln(as-shot R gain / B gain) from the raw's camera white balance,
+    used by inference.apply_params for differential Temperature application.
+    None if unavailable.
+    """
+    import math
+    try:
+        import rawpy
+        with rawpy.imread(str(Path(raw_path))) as raw:
+            wb = list(raw.camera_whitebalance)
+        g = wb[1] or 1.0
+        if wb[0] > 0 and wb[2] > 0:
+            return float(math.log((wb[0] / g) / (wb[2] / g)))
+    except Exception:
+        pass
+    return None
+
+
 def _apply_flip(img: Image.Image, flip: int) -> Image.Image:
     """Rotate a PIL image (from extract_thumb raw JPEG bytes) to correct orientation.
     extract_thumb() returns the embedded JPEG in sensor-native landscape orientation
@@ -98,19 +117,21 @@ def _apply_flip(img: Image.Image, flip: int) -> Image.Image:
 
 def develop_raw(
     raw_path: str | Path,
-    size: tuple[int, int] = DEVELOP_SIZE,
+    size: tuple[int, int] | None = DEVELOP_SIZE,
     neutral: bool = True,
 ) -> Image.Image:
     """
     Demosaic the raw file and resize to fit within `size` (longest-edge bound,
-    aspect ratio preserved). Does NOT apply camera orientation — rawpy always
-    outputs sensor-native landscape. Use get_raw_flip() + _apply_flip() if you
-    need the viewer-correct orientation.
+    aspect ratio preserved). size=None keeps native sensor resolution — use for
+    final output where no downscaling is acceptable. Does NOT apply camera
+    orientation — rawpy always outputs sensor-native landscape. Use
+    get_raw_flip() + _apply_flip() if you need the viewer-correct orientation.
 
     neutral=False uses camera white-balance + auto-brightness (matches camera JPEG).
     """
     raw_path = Path(raw_path)
-    tag = f"dev_neutral_{size[0]}x{size[1]}" if neutral else f"dev_auto_{size[0]}x{size[1]}"
+    size_tag = "native" if size is None else f"{size[0]}x{size[1]}"
+    tag = f"dev_neutral_{size_tag}" if neutral else f"dev_auto_{size_tag}"
     cache_file = _cache_key(raw_path, tag)
 
     if cache_file.exists():
@@ -129,8 +150,9 @@ def develop_raw(
         rgb = raw.postprocess(params)
 
     img = Image.fromarray(rgb).convert("RGB")
-    # Preserve sensor aspect ratio (long edge ≤ max(size)) — no center-crop.
-    img.thumbnail((max(size), max(size)), Image.LANCZOS)
+    if size is not None:
+        # Preserve sensor aspect ratio (long edge ≤ max(size)) — no center-crop.
+        img.thumbnail((max(size), max(size)), Image.LANCZOS)
     img.save(cache_file, format="JPEG", quality=92)
     return img
 

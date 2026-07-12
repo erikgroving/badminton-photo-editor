@@ -1,5 +1,9 @@
+# torch/torchvision: install the right build for your platform FIRST:
+#   Windows + NVIDIA:  pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+#   macOS (Apple Silicon, uses MPS automatically): pip install torch torchvision
 torch>=2.2.0
 torchvision>=0.17.0
+safetensors>=0.4.0
 timm>=0.9.12
 PySide6>=6.5.0
 rawpy>=0.19.0

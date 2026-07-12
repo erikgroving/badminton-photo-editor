@@ -27,12 +27,16 @@ from config import (
     CHECKPOINTS_DIR, COLOR_PARAM_CKPT, COLOR_SIZE, COLOR_UNET_CKPT, CROP_CKPT,
     CULL_MODEL_NAME, DEVELOP_SIZE, JUDGE_CKPT, JUDGE_MODEL_NAME, THUMB_SIZE,
 )
-from data.raw_reader import develop_raw, extract_thumbnail, extract_thumbnail_ar, get_raw_flip
+from data.raw_reader import (develop_raw, extract_thumbnail, extract_thumbnail_ar,
+                             get_as_shot_camlog, get_raw_flip)
 from inference.apply_params import apply_param_vec
 from models.color_correction.param_model import build_param_model
 from models.color_correction.unet import ColorUNet
 from models.cropping.model import (
     build_crop_model, build_combined_crop_model, compute_region_stats, CombinedDINOv2,
+    CombinedDINOv2Exp7, build_exp7_model,
+    CombinedDINOv2Exp8, build_exp8_model, POSE_DIM,
+    CombinedDINOv2Exp9, build_exp9_model,
 )
 from models.culling.model import build_model as build_cull_model
 from models.judge.model import build_model as build_judge
@@ -73,11 +77,18 @@ def _load_crop(device):
     if not ckpt_files:
         raise FileNotFoundError("No crop checkpoint found. Train first.")
 
-    # Prefer exp6 explicitly — intentionally trained best model.
-    # Fallback: select by median_iou but only from test-split evals (n<300),
-    # excluding full-dataset checkpoints with inflated metrics.
+    # Prefer exp9d (test IoU 0.8777, angle MAE 0.74°), then exp8/7/6, then best by median_iou.
+    exp9d_path = CHECKPOINTS_DIR / "cropping_angle_vit_large_patch14_reg4_dinov2_exp9d_full.pt"
+    exp8_path = CHECKPOINTS_DIR / "cropping_angle_vit_large_patch14_reg4_dinov2_exp8.pt"
+    exp7_path = CHECKPOINTS_DIR / "cropping_angle_vit_large_patch14_reg4_dinov2_exp7.pt"
     exp6_path = CHECKPOINTS_DIR / "cropping_angle_vit_base_patch14_reg4_dinov2_exp6_combined.pt"
-    if exp6_path.exists():
+    if exp9d_path.exists():
+        best = exp9d_path
+    elif exp8_path.exists():
+        best = exp8_path
+    elif exp7_path.exists():
+        best = exp7_path
+    elif exp6_path.exists():
         best = exp6_path
     else:
         def _score(f):
@@ -93,7 +104,34 @@ def _load_crop(device):
     input_size = int(ckpt.get("input_size", 518))
     exp_tag    = ckpt.get("exp", "")
 
-    if exp_tag == "exp6_combined":
+    if exp_tag.startswith("exp9"):
+        model = build_exp9_model(
+            backbone=backbone, pretrained=False,
+            pose_dim=ckpt.get("pose_dim", POSE_DIM),
+            cond_emb_dim=ckpt.get("cond_emb_dim", 128),
+            dynamic_img_size=ckpt.get("dynamic_img_size", True),
+        ).to(device)
+        print(f"Crop model: {backbone} [{exp_tag}]  input={input_size}  "
+              f"(median_iou={ckpt['metrics'].get('median_iou',0):.3f})")
+    elif exp_tag == "exp8":
+        model = build_exp8_model(
+            backbone=backbone, pretrained=False,
+            pose_dim=ckpt.get("pose_dim", POSE_DIM),
+            cond_emb_dim=ckpt.get("cond_emb_dim", 128),
+            dynamic_img_size=ckpt.get("dynamic_img_size", True),
+        ).to(device)
+        print(f"Crop model: {backbone} [exp8]  input={input_size}  "
+              f"(median_iou={ckpt['metrics'].get('median_iou',0):.3f})")
+    elif exp_tag == "exp7":
+        model = build_exp7_model(
+            backbone=backbone, pretrained=False,
+            pose_dim=ckpt.get("pose_dim", POSE_DIM),
+            cond_emb_dim=ckpt.get("cond_emb_dim", 128),
+            dynamic_img_size=ckpt.get("dynamic_img_size", True),
+        ).to(device)
+        print(f"Crop model: {backbone} [exp7]  input={input_size}  "
+              f"(median_iou={ckpt['metrics'].get('median_iou',0):.3f})")
+    elif exp_tag == "exp6_combined":
         model = build_combined_crop_model(
             backbone=backbone, pretrained=False,
             cond_dim=ckpt.get("cond_dim", 51),
@@ -123,6 +161,53 @@ def _load_yolo():
     return YOLO(str(bundled) if bundled.exists() else "yolo11n.pt")
 
 
+def _load_yolo_pose():
+    from ultralytics import YOLO
+    for p in [CHECKPOINTS_DIR / "yolo11n-pose.pt", Path("yolo11n-pose.pt")]:
+        if p.exists():
+            return YOLO(str(p))
+    return None   # graceful: caller falls back to zero pose
+
+
+def _detect_players_pose(pose_model, thumb: Image.Image) -> tuple[list, list, list]:
+    """Run YOLO-Pose; return (union_bbox, primary_bbox, pose_kpts [34 floats]).
+    All bboxes normalised [0,1].  pose_kpts are [x,y] for 17 COCO keypoints."""
+    w, h = thumb.size
+    min_area = w * h * 0.01
+    results  = pose_model(thumb, verbose=False)
+    persons  = []
+    for r in results:
+        if r.keypoints is None:
+            continue
+        for i, box in enumerate(r.boxes.xyxy.cpu().tolist()):
+            x1, y1, x2, y2 = map(float, box)
+            area = (x2 - x1) * (y2 - y1)
+            if area < min_area:
+                continue
+            kpts_xy = r.keypoints.xyn[i].cpu().tolist()           # list of [x_n, y_n]
+            confs   = (r.keypoints.conf[i].cpu().tolist()
+                       if r.keypoints.conf is not None else [1.0] * len(kpts_xy))
+            # Zero low-confidence keypoints — matches training convention
+            kpts_flat = []
+            for xy, c in zip(kpts_xy, confs):
+                kpts_flat.extend(xy if c >= 0.3 else [0.0, 0.0])  # 34 floats
+            persons.append({
+                "box":  [x1/w, y1/h, x2/w, y2/h],
+                "area": area,
+                "kpts": kpts_flat,
+            })
+    if not persons:
+        return [0.0]*4, [0.0]*4, [0.0]*POSE_DIM
+    primary = max(persons, key=lambda p: p["area"])
+    union   = primary["box"]
+    if len(persons) > 1:
+        union = [
+            min(p["box"][0] for p in persons), min(p["box"][1] for p in persons),
+            max(p["box"][2] for p in persons), max(p["box"][3] for p in persons),
+        ]
+    return union, primary["box"], primary["kpts"]
+
+
 def _detect_players(yolo_model, thumb: Image.Image) -> tuple[list, list]:
     """Return (union_bbox, primary_bbox) as [x1,y1,x2,y2] normalized [0,1]. Zeros if none."""
     w, h = thumb.size
@@ -145,6 +230,18 @@ def _detect_players(yolo_model, thumb: Image.Image) -> tuple[list, list]:
             max(b[2] for b in boxes), max(b[3] for b in boxes),
         ]
     return union, primary
+
+
+def _load_color_affine(device):
+    """Production color model: full-frame -> 3x4 linear-RGB affine.
+    val dE2000 = 5.53 vs 13.08 do-nothing (slider-renderer ceiling 12.46).
+    Returns None when the checkpoint isn't present (callers fall back to sliders)."""
+    from models.color_correction.affine_model import load_affine_model
+    model = load_affine_model(
+        CHECKPOINTS_DIR / "color_affine_efficientnet_b0.pt", device)
+    if model is not None:
+        print("Color model: 3x4 affine (efficientnet_b0, val dE2000=5.53)")
+    return model
 
 
 def _load_color_param(device):
@@ -211,10 +308,12 @@ def _sensor_native_box(box4: list, flip: int) -> list:
     Inverse of _developed_image_box().
     """
     x1, y1, x2, y2 = box4
-    if flip == 5:   # portrait: 90° CW to display → inverse is 90° CCW
-        return [y1, 1-x2, y2, 1-x1]
-    if flip == 6:   # portrait: 90° CCW to display → inverse is 90° CW
+    # rawpy orients flip=5 by rotating 90° CCW and flip=6 by 90° CW
+    # (empirically verified against develop_raw output; matches _apply_flip).
+    if flip == 5:   # developed = 90° CCW of SN → inverse is 90° CW
         return [1-y2, x1, 1-y1, x2]
+    if flip == 6:   # developed = 90° CW of SN → inverse is 90° CCW
+        return [y1, 1-x2, y2, 1-x1]
     if flip == 3:   # 180°, self-inverse
         return [1-x2, 1-y2, 1-x1, 1-y1]
     return list(box4)  # flip==0: same space
@@ -226,10 +325,10 @@ def _developed_image_box(box4: list, flip: int) -> list:
     (thumbnail/landscape) space into developed-image coordinate space.
     """
     x1, y1, x2, y2 = box4
-    if flip == 5:   # 90° CW to get portrait
-        return [1-y2, x1, 1-y1, x2]
-    if flip == 6:   # 90° CCW to get portrait
+    if flip == 5:   # 90° CCW to get portrait (rawpy convention, verified)
         return [y1, 1-x2, y2, 1-x1]
+    if flip == 6:   # 90° CW to get portrait
+        return [1-y2, x1, 1-y1, x2]
     if flip == 3:   # 180°
         return [1-x2, 1-y2, 1-x1, 1-y1]
     return list(box4)
@@ -261,55 +360,94 @@ def predict_cull(model, threshold, raw_path, device) -> tuple[bool, float]:
 
 
 @torch.no_grad()
+def _run_crop_model(model, thumb: Image.Image, device,
+                    union_sn, primary_sn,
+                    pose_kpts: list | None = None) -> tuple[list, float]:
+    """Single forward pass; returns ([x1,y1,x2,y2] normalised, angle_norm)."""
+    input_size = getattr(model, '_input_size', 518)
+    resized    = thumb.resize((input_size, input_size), Image.LANCZOS)
+    img_t      = _pil_to_tensor(resized, device)
+
+    if isinstance(model, (CombinedDINOv2Exp7, CombinedDINOv2Exp8, CombinedDINOv2Exp9)):
+        union_t  = torch.tensor([union_sn],   dtype=torch.float32, device=device)
+        prim_t   = torch.tensor([primary_sn], dtype=torch.float32, device=device)
+        stats_t  = torch.tensor([compute_region_stats(thumb)],
+                                dtype=torch.float32, device=device)
+        kpts     = pose_kpts if pose_kpts is not None else [0.0] * POSE_DIM
+        pose_t   = torch.tensor([kpts], dtype=torch.float32, device=device)
+        # is_portrait=None → soft blend (inference mode)
+        box_t, ang_t = model(img_t, union_t, prim_t, stats_t, pose_t)
+    elif isinstance(model, CombinedDINOv2):
+        union_t  = torch.tensor([union_sn],   dtype=torch.float32, device=device)
+        prim_t   = torch.tensor([primary_sn], dtype=torch.float32, device=device)
+        stats_t  = torch.tensor([compute_region_stats(thumb)],
+                                dtype=torch.float32, device=device)
+        box_t, ang_t = model(img_t, union_t, prim_t, stats_t)
+    else:
+        pb_t = None
+        if getattr(model, 'use_player_bbox', False):
+            pb_t = torch.tensor([union_sn], dtype=torch.float32, device=device)
+        out = model(img_t, pb_t)
+        if isinstance(out, tuple):
+            box_t, ang_t = out
+        else:
+            box_t  = out
+            ang_t  = torch.zeros(1, device=device)
+
+    return box_t.squeeze(0).cpu().tolist(), float(ang_t.squeeze().item())
+
+
+@torch.no_grad()
 def predict_crop(model, raw_path, device, img_size=None,
                  player_bbox: list | None = None,
-                 primary_bbox: list | None = None) -> tuple[list, float]:
+                 primary_bbox: list | None = None,
+                 pose_kpts: list | None = None,
+                 pose_model=None,
+                 refine: bool = False) -> tuple[list, float]:
     """Returns (crop_box: [x,y,w,h] in pixels, angle_deg: float).
 
     img_size:     actual (W, H) of the orientation-corrected developed image.
     player_bbox:  union bbox [x1,y1,x2,y2] normalised to *developed-image* space.
     primary_bbox: largest-player bbox, same space.  None → falls back to player_bbox.
-
-    Internally: the model was trained on sensor-native (landscape) thumbnails, so
-    player bboxes are converted to sensor-native space before the forward pass, and
-    the predicted box is converted back to developed-image space before returning.
+    pose_kpts:    34 floats [x,y]×17 keypoints (sensor-native, normalised [0,1]).
+                  If None and pose_model is provided, runs pose detection automatically.
+    pose_model:   optional loaded YOLO-Pose model for live keypoint detection.
+    refine:       if True, runs a second crop pass on the coarse prediction region.
     """
-    thumb      = extract_thumbnail_ar(raw_path, max_size=512)
-    input_size = getattr(model, '_input_size', 518)
-    resized    = thumb.resize((input_size, input_size), Image.LANCZOS)
-    img_tensor = _pil_to_tensor(resized, device)
-    flip       = get_raw_flip(raw_path)
+    thumb = extract_thumbnail_ar(raw_path, max_size=512)
+    flip  = get_raw_flip(raw_path)
 
-    # Convert player bboxes from developed-image space → sensor-native space so
-    # conditioning matches the training distribution (bboxes cached from thumbnails).
     def _to_sn(bbox: list | None) -> list:
         if bbox is None:
             return [0.0, 0.0, 0.0, 0.0]
         return _sensor_native_box(bbox, flip)
 
-    if isinstance(model, CombinedDINOv2):
-        union_t   = torch.tensor([_to_sn(player_bbox)], dtype=torch.float32).to(device)
-        pb_sn     = player_bbox if primary_bbox is None else primary_bbox
-        primary_t = torch.tensor([_to_sn(pb_sn)], dtype=torch.float32).to(device)
-        stats_t   = torch.tensor([compute_region_stats(thumb)],
-                                 dtype=torch.float32).to(device)
-        box_t, angle_t = model(img_tensor, union_t, primary_t, stats_t)
-        angle_deg = float(angle_t.squeeze().item()) * 90.0
-    else:
-        pb_tensor = None
-        if getattr(model, 'use_player_bbox', False):
-            pb_tensor = torch.tensor([_to_sn(player_bbox)],
-                                     dtype=torch.float32).to(device)
-        out = model(img_tensor, pb_tensor)
-        if isinstance(out, tuple):
-            box_t, angle_t = out
-            angle_deg = float(angle_t.squeeze().item()) * 90.0
-        else:
-            box_t     = out
-            angle_deg = 0.0
+    union_sn   = _to_sn(player_bbox)
+    pb_sn_bbox = player_bbox if primary_bbox is None else primary_bbox
+    primary_sn = _to_sn(pb_sn_bbox)
 
-    x1, y1, x2, y2 = box_t.squeeze(0).cpu().tolist()
-    x1, y1, x2, y2 = _developed_image_box([x1, y1, x2, y2], flip)
+    # Obtain pose keypoints for exp7/exp8/exp9 (all pose-conditioned)
+    kpts = pose_kpts
+    if kpts is None and isinstance(model, (CombinedDINOv2Exp7, CombinedDINOv2Exp8,
+                                           CombinedDINOv2Exp9)):
+        if pose_model is not None:
+            union_sn, primary_sn, kpts = _detect_players_pose(pose_model, thumb)
+        else:
+            kpts = [0.0] * POSE_DIM
+
+    box_norm, angle_norm = _run_crop_model(model, thumb, device,
+                                           union_sn, primary_sn, kpts)
+
+    if refine:
+        box_norm = _refine_crop(model, thumb, device,
+                                box_norm, union_sn, primary_sn, kpts)
+        # Re-run to get angle from refined pass
+        _, angle_norm = _run_crop_model(model, _crop_thumb(thumb, box_norm),
+                                        device, _scale_bbox(union_sn, box_norm),
+                                        _scale_bbox(primary_sn, box_norm), kpts)
+
+    angle_deg = angle_norm * 90.0
+    x1, y1, x2, y2 = _developed_image_box(box_norm, flip)
     x1 = max(0.0, x1 - 0.02)
     y1 = max(0.0, y1 - 0.02)
     x2 = min(1.0, x2 + 0.02)
@@ -323,13 +461,69 @@ def predict_crop(model, raw_path, device, img_size=None,
     return [x, y, w, h], angle_deg
 
 
+def _crop_thumb(thumb: Image.Image, box: list) -> Image.Image:
+    """Crop a PIL image to the given [x1,y1,x2,y2] normalised region."""
+    W, H  = thumb.size
+    margin = 0.06
+    x1 = max(0.0, box[0] - margin)
+    y1 = max(0.0, box[1] - margin)
+    x2 = min(1.0, box[2] + margin)
+    y2 = min(1.0, box[3] + margin)
+    return thumb.crop((x1*W, y1*H, x2*W, y2*H))
+
+
+def _scale_bbox(bbox: list, crop_box: list) -> list:
+    """Re-express bbox (normalised to full image) in the space of crop_box region."""
+    cx1, cy1, cx2, cy2 = crop_box[0], crop_box[1], crop_box[2], crop_box[3]
+    margin = 0.06
+    rx1 = max(0.0, cx1 - margin); ry1 = max(0.0, cy1 - margin)
+    rx2 = min(1.0, cx2 + margin); ry2 = min(1.0, cy2 + margin)
+    rw, rh = rx2 - rx1, ry2 - ry1
+    if rw < 1e-6 or rh < 1e-6 or bbox == [0.0]*4:
+        return [0.0, 0.0, 0.0, 0.0]
+    return [
+        (bbox[0] - rx1) / rw,
+        (bbox[1] - ry1) / rh,
+        (bbox[2] - rx1) / rw,
+        (bbox[3] - ry1) / rh,
+    ]
+
+
+def _refine_crop(model, thumb: Image.Image, device,
+                 coarse: list, union_sn: list, primary_sn: list,
+                 kpts: list | None) -> list:
+    """Second-pass crop: zoom into coarse region, predict again, map back."""
+    margin = 0.06
+    x1 = max(0.0, coarse[0] - margin)
+    y1 = max(0.0, coarse[1] - margin)
+    x2 = min(1.0, coarse[2] + margin)
+    y2 = min(1.0, coarse[3] + margin)
+    rw, rh = x2 - x1, y2 - y1
+
+    cropped      = _crop_thumb(thumb, coarse)
+    union_local  = _scale_bbox(union_sn,  coarse)
+    primary_local = _scale_bbox(primary_sn, coarse)
+
+    refined, _ = _run_crop_model(model, cropped, device,
+                                 union_local, primary_local, kpts)
+    # Map refined normalised coords back to full image
+    return [
+        x1 + refined[0] * rw,
+        y1 + refined[1] * rh,
+        x1 + refined[2] * rw,
+        y1 + refined[3] * rh,
+    ]
+
+
 @torch.no_grad()
-def apply_color_param(model, img: Image.Image, device) -> tuple[Image.Image, list]:
-    """Returns (corrected_image, param_vec)."""
+def apply_color_param(model, img: Image.Image, device,
+                      camlog: float | None = None) -> tuple[Image.Image, list]:
+    """Returns (corrected_image, param_vec). camlog: as-shot WB log-ratio for
+    differential Temperature application (data.raw_reader.get_as_shot_camlog)."""
     resized = img.resize(getattr(model, '_input_size', COLOR_SIZE), Image.LANCZOS)
     inp     = transforms.ToTensor()(resized).unsqueeze(0).to(device)
     vec     = model(inp).squeeze(0).cpu().tolist()
-    return apply_param_vec(img, vec), vec
+    return apply_param_vec(img, vec, camlog=camlog), vec
 
 
 @torch.no_grad()
@@ -417,8 +611,16 @@ def run_pipeline(
 
     cull_model, threshold = _load_cull(device)
     crop_model = _load_crop(device)
-    yolo_model = _load_yolo() if isinstance(crop_model, CombinedDINOv2) else None
-    color_mod  = _load_color_param(device) if color_model == "param" else _load_color_unet(device)
+    _cond_crop = isinstance(crop_model, (CombinedDINOv2, CombinedDINOv2Exp7,
+                                         CombinedDINOv2Exp8, CombinedDINOv2Exp9))
+    yolo_model = _load_yolo() if _cond_crop else None
+    pose_model = (_load_yolo_pose()
+                  if isinstance(crop_model, (CombinedDINOv2Exp7, CombinedDINOv2Exp8,
+                                             CombinedDINOv2Exp9)) else None)
+    affine_mod = _load_color_affine(device)
+    color_mod  = None
+    if affine_mod is None:
+        color_mod = _load_color_param(device) if color_model == "param" else _load_color_unet(device)
     judge      = _load_judge(device)
 
     if not dry_run:
@@ -440,14 +642,26 @@ def run_pipeline(
             union_bbox, primary_bbox = _detect_players(yolo_model, thumb)
         else:
             union_bbox = primary_bbox = None
+        # size=None: native sensor resolution — crop applies to the full image.
+        # neutral=False: camera WB + auto-brighten, matching the color model's
+        # training distribution (default neutral=True fed it a dark orange render).
+        raw_img = develop_raw(raw_path, size=None, neutral=False)
         crop_box, angle_deg = predict_crop(crop_model, raw_path, device,
+                                           img_size=raw_img.size,
                                            player_bbox=union_bbox,
-                                           primary_bbox=primary_bbox)
-        raw_img = develop_raw(raw_path, size=DEVELOP_SIZE)
+                                           primary_bbox=primary_bbox,
+                                           pose_model=pose_model)
         cropped = apply_crop(raw_img, crop_box, angle_deg)
 
-        if color_model == "param":
-            corrected, vec = apply_color_param(color_mod, cropped, device)
+        if affine_mod is not None:
+            from models.color_correction.affine_model import (apply_affine_pil,
+                                                              predict_affine)
+            M = predict_affine(affine_mod, raw_img, device)
+            corrected = apply_affine_pil(cropped, M)
+            vec = None
+        elif color_model == "param":
+            corrected, vec = apply_color_param(color_mod, cropped, device,
+                                               camlog=get_as_shot_camlog(raw_path))
         else:
             corrected = apply_color_unet(color_mod, cropped, device)
             vec       = None

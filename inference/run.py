@@ -33,11 +33,13 @@ from config import (
     CHECKPOINTS_DIR, COLOR_PARAM_CKPT, COLOR_SIZE, CROP_CKPT, CULL_MODEL_NAME,
     DEVELOP_SIZE, THUMB_SIZE,
 )
-from data.raw_reader import develop_raw, extract_thumbnail, extract_thumbnail_ar, get_raw_flip
+from data.raw_reader import (develop_raw, extract_thumbnail, extract_thumbnail_ar,
+                             get_as_shot_camlog, get_raw_flip)
 from inference.apply_params import apply_param_vec
 from inference.pipeline import (
-    _load_color_param, _load_crop, _load_cull, _load_yolo, _detect_players,
-    apply_color_param, apply_crop, predict_crop, _developed_image_box,
+    _load_color_param, _load_crop, _load_cull, _load_yolo, _load_yolo_pose,
+    _detect_players, apply_color_param, apply_crop, predict_crop,
+    _developed_image_box,
 )
 from models.culling.model import build_model as build_cull_model
 
@@ -341,13 +343,21 @@ def run_processing_stage(
     )
 
     crop_model  = _load_crop(device)
-    color_model = _load_color_param(device)
+    from inference.pipeline import _load_color_affine
+    affine_model = _load_color_affine(device)
+    color_model  = None if affine_model is not None else _load_color_param(device)
     try:
         # One shared YOLO instance — used for both crop conditioning and color player-crop
         _detector = _load_yolo()
     except Exception as exc:
         print(f"YOLO detector unavailable ({type(exc).__name__}): {exc}. Using center-crop fallback.")
         _detector = None
+    try:
+        # Pose model for exp7/8/9 keypoint conditioning (None → zeros fallback)
+        _pose_model = _load_yolo_pose()
+    except Exception as exc:
+        print(f"YOLO pose unavailable ({type(exc).__name__}): {exc}. Using zero-pose fallback.")
+        _pose_model = None
 
     import shutil
     for sub in ("crops", "colors_and_lightning"):
@@ -360,7 +370,9 @@ def run_processing_stage(
     for i, p in enumerate(passed_raws):
         if progress_cb:
             progress_cb(2, i, n_passed, p.name)
-        raw_img = develop_raw(p, size=DEVELOP_SIZE, neutral=False)
+        # size=None: develop at native sensor resolution — the crop is applied to
+        # the full-resolution image, so final JPEGs lose no pixels.
+        raw_img = develop_raw(p, size=None, neutral=False)
 
         # Detect on the sensor-native (landscape) thumbnail — same space the model
         # was trained on.  Convert to developed-image space so predict_crop can
@@ -378,6 +390,7 @@ def run_processing_stage(
             img_size=raw_img.size,
             player_bbox=union_bbox,
             primary_bbox=primary_bbox,
+            pose_model=_pose_model,
         )
 
         is_portrait = flip in (5, 6, 3)
@@ -401,13 +414,35 @@ def run_processing_stage(
         if not crop_jpg.exists():
             continue
         cropped = Image.open(crop_jpg).convert("RGB")
-        # Feed only the player region to the color model so bright backgrounds
-        # don't skew the WB/exposure prediction.
-        color_inp = _player_region_crop(cropped, _detector, color_sz)
-        inp = transforms.ToTensor()(color_inp).unsqueeze(0).to(device)
-        with torch.no_grad():
-            vec = color_model(inp).squeeze(0).cpu().tolist()
-        corrected = apply_param_vec(cropped, vec)
+
+        if affine_model is not None:
+            # Production path: full-frame 256px -> 3x4 affine, applied to the
+            # native-res crop. Sliders are distilled per photo purely for the
+            # Lightroom XMP sidecar (written next to the CR3 in culls/passed/).
+            from models.color_correction.affine_model import (apply_affine_pil,
+                                                              predict_affine)
+            from inference.slider_distill import distill_sliders
+            from inference.export_xmp import write_xmp
+            dev_full = develop_raw(p, size=COLOR_SIZE, neutral=False)
+            M = predict_affine(affine_model, dev_full, device)
+            corrected = apply_affine_pil(cropped, M)
+            try:
+                params, _resid = distill_sliders(dev_full, M,
+                                                 get_as_shot_camlog(p), device)
+                write_xmp(p, params)
+            except Exception as exc:
+                print(f"XMP distillation failed for {p.name}: {exc}")
+        else:
+            # Legacy slider path (no affine checkpoint present).
+            # Feed only the player region to the color model so bright
+            # backgrounds don't skew the WB/exposure prediction.
+            color_inp = _player_region_crop(cropped, _detector, color_sz)
+            inp = transforms.ToTensor()(color_inp).unsqueeze(0).to(device)
+            with torch.no_grad():
+                vec = color_model(inp).squeeze(0).cpu().tolist()
+            # As-shot WB enables differential Temperature application
+            corrected = apply_param_vec(cropped, vec, camlog=get_as_shot_camlog(p))
+
         out = output_dir / "colors_and_lightning" / f"{p.stem}.jpg"
         corrected.save(out, format="JPEG", quality=jpeg_quality)
 

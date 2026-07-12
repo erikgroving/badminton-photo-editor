@@ -1,5 +1,5 @@
 """
-review/server.py — Jay Ma Photo Review Server
+review/server.py — Badminton AI Photo Editor Review Server
 
 Reads a pipeline output directory and serves a browser-based review UI:
   - Cull Review:     passed vs culled grid, sortable by score or filename
@@ -15,9 +15,9 @@ Output directory layout expected:
     crops/                 ← cropped JPEGs from pipeline
     colors_and_lightning/  ← color-corrected JPEGs from pipeline
     finals/
-      original/            ← Jay selected: needs full rework (large thumbnail)
-      cropped/             ← Jay selected: crop OK, color needs work
-      colored/             ← Jay selected: looks great, use this
+      original/            ← user selected: needs full rework (large thumbnail)
+      cropped/             ← user selected: crop OK, color needs work
+      colored/             ← user selected: looks great, use this
       selections.json      ← saved automatically on each click
 
 Usage:
@@ -98,6 +98,18 @@ def _load_data() -> dict:
             break
     else:
         return {"error": "No rankings.json found. Run the pipeline first.", "photos": []}
+
+    # The filesystem is the source of truth for decisions — burst review moves
+    # files between passed/ and culled/, and processing follows the folders.
+    # rankings.json can lag if its rewrite failed (e.g. transient file lock),
+    # so override stale decisions here instead of showing ghost photos.
+    passed_dir = _output_dir / "culls" / "passed"
+    culled_dir = _output_dir / "culls" / "culled"
+    for p in photos:
+        if (passed_dir / p["filename"]).exists():
+            p["decision"] = "passed"
+        elif (culled_dir / p["filename"]).exists():
+            p["decision"] = "culled"
 
     # Enrich with which pipeline outputs actually exist
     crops_dir  = _output_dir / "crops"
@@ -193,6 +205,23 @@ def _get_thumbnail_bytes(filename: str, size: int = 1200) -> bytes:
     return data
 
 
+def _get_original_fullres_bytes(filename: str) -> bytes:
+    """Full-resolution developed JPEG of the CR3 for finals/original export.
+    Same develop path as _get_thumbnail_bytes but with no size cap."""
+    cr3 = _find_cr3(filename)
+    if cr3 is None:
+        raise FileNotFoundError(f"CR3 not found: {filename}")
+
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).parent.parent))
+    from data.raw_reader import develop_raw
+    img = develop_raw(cr3, size=None, neutral=False)
+
+    buf = io.BytesIO()
+    img.save(buf, "JPEG", quality=95)
+    return buf.getvalue()
+
+
 # ─── Selection writing ──────────────────────────────────────────────────────────
 
 def _save_selection(filename: str, version: Optional[str]):
@@ -219,10 +248,21 @@ def _save_selection(filename: str, version: Optional[str]):
 
 
 def _export_all_selections() -> tuple[int, list[str]]:
-    """Copy/save selected versions to finals/<version>/ subdirectories."""
+    """Copy/save selected versions to finals/<version>/ subdirectories.
+
+    Starts from a clean slate: the three version folders are wiped first so
+    finals/ reflects exactly the CURRENT selections — no stale files from
+    previous exports (e.g. a photo that was deselected or moved between
+    versions). selections.json itself is preserved.
+    """
     sel_path = _output_dir / "finals" / "selections.json"
     if not sel_path.exists():
         return 0, []
+
+    for version in ("original", "cropped", "colored"):
+        d = _output_dir / "finals" / version
+        if d.exists():
+            shutil.rmtree(d)
 
     sels = json.loads(sel_path.read_text())
     copied = 0
@@ -235,7 +275,7 @@ def _export_all_selections() -> tuple[int, list[str]]:
             dst = dest_dir / f"{stem}.jpg"
 
             if version == "original":
-                # Use a larger cached thumbnail as the proxy for "original"
+                # Full-resolution develop of the raw — no downscaling in finals
                 cr3_name = next(
                     (f.name for f in [
                         _output_dir / "culls" / "passed" / f"{stem}.CR3",
@@ -245,13 +285,13 @@ def _export_all_selections() -> tuple[int, list[str]]:
                     ] if f.exists()),
                     f"{stem}.CR3",
                 )
-                data = _get_thumbnail_bytes(cr3_name, size=1200)
+                data = _get_original_fullres_bytes(cr3_name)
                 dst.write_bytes(data)
             elif version == "cropped":
                 src = _output_dir / "crops" / f"{stem}.jpg"
                 shutil.copy2(src, dst)
             elif version == "colored":
-                src = _output_dir / "colors_and_lighting" / f"{stem}.jpg"
+                src = _output_dir / "colors_and_lightning" / f"{stem}.jpg"
                 shutil.copy2(src, dst)
             else:
                 errors.append(f"Unknown version '{version}' for {stem}")
@@ -366,7 +406,7 @@ HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>Jay Ma Photo Review</title>
+<title>Badminton AI Photo Editor — Review</title>
 <style>
   :root {
     --bg:#111; --surface:#1c1c1c; --border:#2a2a2a; --text:#e0e0e0; --muted:#666;
@@ -456,7 +496,7 @@ HTML = r"""<!DOCTYPE html>
 
 <div id="sticky-head">
 <div id="hdr">
-  <h1>Jay Ma · Stage Selection</h1>
+  <h1>Badminton AI Photo Editor · Stage Selection</h1>
   <div id="hdr-right">
     <select class="sort" id="srt" onchange="applySort()">
       <option value="name-asc">Name A → Z</option>
@@ -688,7 +728,7 @@ init();
 def main():
     global _output_dir
 
-    parser = argparse.ArgumentParser(description="Jay Ma Photo Review Server")
+    parser = argparse.ArgumentParser(description="Badminton AI Photo Editor Review Server")
     parser.add_argument("output_dir",  help="Pipeline output directory (contains culls/, crops/, colors_and_lightning/)")
     parser.add_argument("--port",      type=int, default=8765)
     parser.add_argument("--no-browser", action="store_true")

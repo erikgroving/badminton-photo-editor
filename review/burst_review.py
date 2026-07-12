@@ -4,7 +4,7 @@ Burst-by-burst review UI — second culling pass after AI selection.
 Workflow:
   1. AI has already passed top X% of photos into culls/passed/
   2. This server groups those photos into bursts (1-second EXIF gap)
-  3. Jay reviews each burst: click to deselect, N to confirm and advance
+  3. User reviews each burst: click to deselect, N to confirm and advance
   4. Unselected photos move from culls/passed/ -> culls/culled/
   5. rankings.json is updated with final decisions
 
@@ -397,17 +397,28 @@ class ReviewState:
             return {"current_idx": self.current_idx}
 
     def _update_rankings(self, newly_passed: set[str], newly_culled: set[str]):
-        try:
-            data = json.loads(self.rankings_path.read_text())
-            for p in data["photos"]:
-                if p["filename"] in newly_culled:
-                    p["decision"] = "culled"
-                    p["burst_culled"] = True
-                elif p["filename"] in newly_passed:
-                    p["decision"] = "passed"
-            self.rankings_path.write_text(json.dumps(data, indent=2))
-        except Exception as exc:
-            print(f"Warning: could not update rankings.json: {exc}")
+        """Atomic write with retries — a transient lock (concurrent reader,
+        cloud-sync) must not silently desync rankings.json from the folders."""
+        import os
+        import time
+        for attempt in range(4):
+            try:
+                data = json.loads(self.rankings_path.read_text())
+                for p in data["photos"]:
+                    if p["filename"] in newly_culled:
+                        p["decision"] = "culled"
+                        p["burst_culled"] = True
+                    elif p["filename"] in newly_passed:
+                        p["decision"] = "passed"
+                tmp = self.rankings_path.with_suffix(".json.tmp")
+                tmp.write_text(json.dumps(data, indent=2))
+                os.replace(tmp, self.rankings_path)
+                return
+            except Exception as exc:
+                if attempt == 3:
+                    print(f"Warning: could not update rankings.json: {exc}")
+                else:
+                    time.sleep(0.3)
 
     def culled_list(self, sort: str = "score") -> list:
         _seen: set[str] = set()
@@ -449,7 +460,7 @@ class ReviewState:
             return None
         try:
             from data.raw_reader import extract_thumbnail
-            img = extract_thumbnail(p, size=(600, 600), oriented=True)
+            img = extract_thumbnail(p, size=(1024, 1024), oriented=True)
             buf = io.BytesIO()
             img.save(buf, format="JPEG", quality=85)
             return buf.getvalue()
@@ -473,7 +484,7 @@ _HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Burst Review — Jay Ma Photography</title>
+<title>Burst Review — Badminton AI Photo Editor</title>
 <link rel="icon" type="image/png" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAEzUlEQVR4nL1WbUhbVxi+556bxN4Vg9UF1Np1ndrV2DV+1YJ0MD9mcZuD/JjDlJVo8V8HM4N2o5vUf9M6WP2ko9YJHbof/mh/qGCDZa5TUUexNhOdOu3UYDTGJCY3995zxs3Ra4xGN9A+gXDv+Xif977v877nAIwxdZigD9U69QoIGIqiMMYIIQAAGcIY0zQd+IoQoultrpARec0eADzPM4xEEwRBEAAAGONdZ4PW7G4aAAihND02NlZZWRkerhYEASoYp8NRVlaWk5MjLzWZTBQALMuKoqhgGKfLRVHU9zU1+7ov0bS0/PTg5wc8z9fV1q2vr7MsW1X13fDwiMFgWF9fV6mUZrNZo9FUV1dDBkpu+R0v/9JkXVy8kHmB47jA6GE/IAMFQUjRpRiNRnD0aPiVK5/p9frs7PfIotHR5+3t7QghjLGP98XGxpR/Ub7TtXvN92y2ZQghRW2FiPaDoijLC8uzZ6P9/U+p1NR0QisIAkJIFEW8G9B24NDwejmM8fj4+KVLBZJeeN7ncDhkVdA0jRASAiCKIsmYHAHyLIqiNLcJjuNEUbzx1dfHIqN8Ps6+usoL/IZMGYahaVoWg/yZMhBCZFzWpSiK/uBsgbj3aVGRNilJoVDKPoWUYKB12s/38p+XC/ML7GusNkkLIQwqDgCkZ53unE53LnD7PgTIb2V09PnNb24uzM+r1WqPx4sxvnq11Gg07lqAkpQViq2hs2ffcblcJI1B6SIJ7+npOXnyzdq6ervdjjHmeaH3yZPzmZnXPr8mr9m5q39gIDfvfSnsoQiIWhYWFhISE/v6+uRBWXJp6enNzc3keQ+CkM1OFEUAQF19XX5+flZWls/nk/XD8zyEsLGhoampief5oCgFIeQcEcnw0LBer0cISV1lU0IKhQJjnJGRcYRlJyYmAABEZrtinySvOZ1hYWEke5iSfoRm45+i19bW9rawOwGJLAB0akoK7a++nXHgeT4iQh0dHS3z/ScCkkkIIZFabW3t9PS02Wz+e3bW7XZjhJVKhUajOXXqVHx8fEdHR+BGcpCEJJBNQwg9Hg93d3dXV/cLi4WBMDom5vWoKKVSSdOQ57mRkT8WF61O51pkVKTBYPi4sFCO285kMEGlPzU11djY2NvbGxkZlZ2dXVpawjCKoaGh2bnZ5eUVhJBKpYqLi7v47sXjscctf1rs9hUAQFVV1cNHDysqKvJy8ziOU6lUWwRo03Gr1XrrVuVvT/vycvNaWlq0Wi1Zcf9+y+PHPekZGYkJCdLHeb0zMzNtbW1vnDhRX19PUdTS0tIPd+5cvmwoN5luXL9uKDZsO+N0KakY44aGhjNJSeUmk9VqleuFtFIcAj6fz+v1IoRu3645/faZ1dXVycnJxNOJra2tGOPf+/tJoTFut7ug4AOO479pb09OTiYnbaBssP8Tg4RA0zRRgcfjuXv3x6KiT9R+pKefLykpjTgWEf9W/EaI/pqcNBQXV1R8S0xDCINOeeA/u3fqj8QBQpiWltrX9+uHhR+5XK7BgaEjLOtyuhBCDodD2t7V1ZWfny93fOr/AG82j8HBwZWVFbVavWSzLdtsRqNxbm6us7OzrKxMulXs7LoHCOZArCN/lyV3JHKVkqsq5LXpoEAfqvVXQfAvtL6ESpuk6AEAAAAASUVORK5CYII=">
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -756,7 +767,7 @@ function showDone(d) {
     '└── colors_and_lightning/ ← color-corrected (run next step)';
 
   document.getElementById('done-next').innerHTML =
-    'Back in the Jay Pipeline app, click <b>Run Crop &amp; Color</b> to generate the final JPEGs.';
+    'Back in the Badminton AI Photo Editor app, click <b>Run Crop &amp; Color</b> to generate the final JPEGs.';
 }
 
 document.addEventListener('keydown', e => {
@@ -795,7 +806,7 @@ _CULLED_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Culled Photos — Jay Ma Photography</title>
+<title>Culled Photos — Badminton AI Photo Editor</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { background: #111; color: #eee; font-family: -apple-system, sans-serif; }
@@ -815,14 +826,17 @@ _CULLED_HTML = r"""<!DOCTYPE html>
   .sort-btn.active { background: #4a90d9; border-color: #4a90d9; color: #fff; }
   #grid {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
-    gap: 12px; padding: 16px;
+    grid-template-columns: repeat(auto-fill, minmax(680px, 1fr));
+    gap: 14px; padding: 16px;
+  }
+  @media (max-width: 760px) {
+    #grid { grid-template-columns: 1fr; }
   }
   .card {
     background: #1a1a1a; border-radius: 6px; overflow: hidden;
     border: 1px solid #2a2a2a; display: flex; flex-direction: column;
   }
-  .thumb-wrap { position: relative; aspect-ratio: 2/3; background: #222; overflow: hidden; }
+  .thumb-wrap { position: relative; aspect-ratio: 1/1; background: #222; overflow: hidden; }
   .thumb-wrap img { width: 100%; height: 100%; object-fit: contain; display: block; background: #222; }
   .score-badge {
     position: absolute; bottom: 5px; right: 5px;

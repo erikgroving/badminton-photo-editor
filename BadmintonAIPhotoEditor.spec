@@ -1,9 +1,9 @@
 # -*- mode: python ; coding: utf-8 -*-
 """
-PyInstaller spec for Jay Pipeline.
+PyInstaller spec for Badminton AI Photo Editor.
 Build on each platform to get the correct binary:
-  Windows  →  dist/Jay Pipeline/Jay Pipeline.exe
-  Mac      →  dist/Jay Pipeline.app  (then wrapped into .dmg by build.py)
+  Windows  →  dist/Badminton AI Photo Editor/Badminton AI Photo Editor.exe
+  Mac      →  dist/Badminton AI Photo Editor.app  (then wrapped into .dmg by build.py)
 
 Run via build.py, not directly.
 """
@@ -63,7 +63,9 @@ project_hidden = [
     'models.culling.model',
     'models.cropping.model',
     'models.color_correction.param_model',
+    'models.color_correction.affine_model',
     'models.color_correction.unet',
+    'inference.slider_distill',
     'models.judge.model',
     'tqdm',
     'safetensors',
@@ -104,7 +106,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='Jay Pipeline',
+    name='Badminton AI Photo Editor',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -125,16 +127,16 @@ coll = COLLECT(
     strip=False,
     upx=False,
     upx_exclude=[],
-    name='Jay Pipeline',
+    name='Badminton AI Photo Editor',
 )
 
 # Mac: wrap the COLLECT output into a .app bundle
 if sys.platform == 'darwin':
     app = BUNDLE(
         coll,
-        name='Jay Pipeline.app',
+        name='Badminton AI Photo Editor.app',
         icon='assets/icon.png',
-        bundle_identifier='com.jayma.pipeline',
+        bundle_identifier='com.badmintonai.photoeditor',
         info_plist={
             'NSHighResolutionCapable': True,
             'CFBundleShortVersionString': '1.0.0',

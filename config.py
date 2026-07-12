@@ -12,7 +12,7 @@ def _weights_dir() -> Path:
         return BASE_DIR / "checkpoints"
     exe = Path(sys.executable)
     if sys.platform == 'darwin' and '.app' in str(exe):
-        # Jay Pipeline.app/Contents/MacOS/exe → Contents/Resources/weights
+        # Badminton AI Photo Editor.app/Contents/MacOS/exe → Contents/Resources/weights
         return exe.parent.parent / 'Resources' / 'weights'
     # Windows onedir: weights/ sits next to the .exe
     return exe.parent / 'weights'

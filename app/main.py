@@ -1,8 +1,8 @@
 """
-Jay Ma Photography Pipeline — desktop app.
+Badminton AI Photo Editor — desktop app.
 
 Two-phase workflow:
-  Phase 1  Cull + Player Coverage  →  Jay reviews bursts in browser
+  Phase 1  Cull + Player Coverage  →  user reviews bursts in browser
   Phase 2  Crop + Color Correction →  final results
 
 Run:
@@ -180,7 +180,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Jay Ma Photography Pipeline")
+        self.setWindowTitle("Badminton AI Photo Editor")
         self.setWindowIcon(_app_icon())
         self.setMinimumSize(680, 780)
         self._cull_worker:    CullingWorker    | None = None
@@ -202,7 +202,7 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(28, 20, 28, 20)
 
         # ── Title ──────────────────────────────────────────────────────────────
-        title = QLabel("Jay Ma Photography Pipeline")
+        title = QLabel("Badminton AI Photo Editor")
         title.setFont(QFont("-apple-system", 17, QFont.Weight.Bold))
         layout.addWidget(title)
 
@@ -291,7 +291,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.cull_count_lbl)
 
         self.coverage_count_lbl = QLabel("")
-        self.coverage_count_lbl.setStyleSheet("color: #a0d4f5; font-size: 12px;")
+        self.coverage_count_lbl.setStyleSheet("color: #2b7bd0; font-size: 12px; font-weight: 600;")
         layout.addWidget(self.coverage_count_lbl)
 
         # Review Bursts + View Culled Photos side by side
@@ -363,7 +363,7 @@ class MainWindow(QMainWindow):
             if not self.output_edit.text().strip():
                 import os
                 name    = Path(folder).name
-                desktop = Path(os.path.expanduser("~")) / "Desktop" / "JayPipeline" / name
+                desktop = Path(os.path.expanduser("~")) / "Desktop" / "Badminton AI Photo Editor" / name
                 self.output_edit.setText(str(desktop))
 
     def _browse_output(self):
@@ -443,7 +443,9 @@ class MainWindow(QMainWindow):
         n_total       = summary.get("total",       0)
         n_passed_cull = summary.get("passed_cull", summary.get("passed", 0))
         n_passed      = summary.get("passed",      0)
-        n_promoted    = n_passed - n_passed_cull
+        # coverage_stats is authoritative; passed-count delta is the fallback
+        n_promoted    = summary.get("coverage_stats", {}).get(
+            "n_promoted", n_passed - n_passed_cull)
 
         self.cull_count_lbl.setText(
             f"After culling: {n_passed_cull:,} passed / {n_total - n_passed_cull:,} culled"

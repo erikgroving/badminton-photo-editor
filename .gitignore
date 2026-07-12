@@ -93,3 +93,8 @@ watch_training.py
 .DS_Store
 Thumbs.db
 Desktop.ini
+
+# ── Generated preview pages / eval outputs ────────────────────────────────────
+crop_preview*.html
+color_preview*.html
+color_eval_*.json
