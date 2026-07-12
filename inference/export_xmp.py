@@ -38,18 +38,26 @@ from config import COLOR_PARAM_NAMES, COLOR_PARAM_RANGES
 #   Tint:       -150 .. +150
 #   Saturation: -100 .. +100
 
-# XMP key, scale function (param_value → XMP value)
+# Params dicts use XMP names directly (config.COLOR_PARAM_NAMES / vec_to_params
+# output) and values are already on the Lightroom scale — keys map 1:1.
+# NOTE: the previous map used legacy lowercase keys ("exposure", "temp_shift"),
+# which no params dict has contained since the XMP-GT migration — every lookup
+# silently defaulted and sidecars came out all-zero.
 _XMP_MAP: dict[str, tuple[str, callable]] = {
-    "exposure":   ("Exposure2012",  lambda v: f"{v:.4f}"),
-    "contrast":   ("Contrast2012",  lambda v: f"{int(round(v))}"),
-    "highlights": ("Highlights2012",lambda v: f"{int(round(v))}"),
-    "shadows":    ("Shadows2012",   lambda v: f"{int(round(v))}"),
-    "whites":     ("Whites2012",    lambda v: f"{int(round(v))}"),
-    "blacks":     ("Blacks2012",    lambda v: f"{int(round(v))}"),
-    # temp_shift is a kelvin delta around 5500K (midpoint)
-    "temp_shift": ("Temperature",   lambda v: f"{int(round(5500 + v * 40))}"),
-    "tint_shift": ("Tint",          lambda v: f"{int(round(v * 3))}"),
-    "saturation": ("Saturation",    lambda v: f"{int(round(v))}"),
+    "Temperature":         ("Temperature",         lambda v: f"{int(round(v))}"),
+    "Tint":                ("Tint",                lambda v: f"{int(round(v))}"),
+    "Exposure2012":        ("Exposure2012",        lambda v: f"{v:+.2f}"),
+    "Contrast2012":        ("Contrast2012",        lambda v: f"{int(round(v))}"),
+    "Highlights2012":      ("Highlights2012",      lambda v: f"{int(round(v))}"),
+    "Shadows2012":         ("Shadows2012",         lambda v: f"{int(round(v))}"),
+    "Whites2012":          ("Whites2012",          lambda v: f"{int(round(v))}"),
+    "Blacks2012":          ("Blacks2012",          lambda v: f"{int(round(v))}"),
+    "Vibrance":            ("Vibrance",            lambda v: f"{int(round(v))}"),
+    "Saturation":          ("Saturation",          lambda v: f"{int(round(v))}"),
+    "Clarity2012":         ("Clarity2012",         lambda v: f"{int(round(v))}"),
+    "Texture":             ("Texture",             lambda v: f"{int(round(v))}"),
+    "Dehaze":              ("Dehaze",              lambda v: f"{int(round(v))}"),
+    "HueAdjustmentYellow": ("HueAdjustmentYellow", lambda v: f"{int(round(v))}"),
 }
 
 _XMP_TEMPLATE = """\
@@ -60,6 +68,7 @@ _XMP_TEMPLATE = """\
         xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/">
       <crs:Version>15.0</crs:Version>
       <crs:ProcessVersion>11.0</crs:ProcessVersion>
+      <crs:WhiteBalance>Custom</crs:WhiteBalance>
       {sliders}
     </rdf:Description>
   </rdf:RDF>

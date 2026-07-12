@@ -211,9 +211,17 @@ def train_param_model(records_train, records_val, records_test, device, judge, e
 
         if v_l1 < best_l1:
             best_l1      = v_l1
-            best_metrics = {"model": "param", "param_l1": v_l1, "judge_score": j_score, "epoch": epoch}
+            # "val_l1" + top-level "backbone"/"player_crop" are REQUIRED by
+            # inference/pipeline._load_color_param — checkpoints without them
+            # crash the loader ('?' formatted as float) or rebuild the wrong
+            # backbone from None.
+            best_metrics = {"model": "param", "val_l1": v_l1, "param_l1": v_l1,
+                            "judge_score": j_score, "epoch": epoch}
             torch.save({"epoch": epoch, "model_state": gen.state_dict(),
-                        "judge_state": judge.state_dict(), "metrics": best_metrics}, COLOR_PARAM_CKPT)
+                        "backbone": param_backbone,
+                        "player_crop": True,
+                        "judge_state": judge.state_dict(),
+                        "metrics": best_metrics}, COLOR_PARAM_CKPT)
             print(f"    [OK] Saved best param model (val_l1={best_l1:.4f})")
 
     # Final test evaluation
